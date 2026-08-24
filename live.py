@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 
 import os
+import re
 import time
 import signal
+import hashlib
 import subprocess
 import threading
 from pathlib import Path
 
 import dotenv
+from PIL import Image, ImageDraw, ImageFont
 
 dotenv.load_dotenv()
 
@@ -325,6 +328,308 @@ def get_videos():
     return valid_videos
 
 # ============================================================
+# METADADOS DO NOME DO ARQUIVO
+# ============================================================
+
+# Ex: "BRUNO LEMELA - EX-PRODUTOR DO PÂNICO... #ep57 -  ELENCO B CAST - Elenco B Cast - 2026-08-23_5_small_cut_subtitles.mp4"
+#
+# Estratégia: separar pelo FINAL do nome, que é fixo e confiável
+# (CHANNEL_UPPER - Channel Display - date_id_suffix). O que sobrar
+# no começo é o título, mesmo que tenha " - " dentro dele.
+
+EPISODE_PATTERN = re.compile(r"#ep(\d+)", re.IGNORECASE)
+
+
+def parse_video_metadata(video_path):
+    """
+    Extrai título, canal, episódio e data do nome do arquivo.
+    Se o nome não bater com o padrão esperado, cai pra um
+    fallback (só o nome do arquivo sem extensão).
+    """
+
+    name = video_path.name
+
+    if not name.lower().endswith(VIDEO_SUFFIX.lower()):
+        return {"title": video_path.stem, "channel": "", "episode": "", "date": ""}
+
+    base = name[: -len(VIDEO_SUFFIX)]  # remove sufixo fixo
+
+    # Separa "..._5" (id) do final -> data
+    date_match = re.search(r"-\s*(\d{4}-\d{2}-\d{2})_\d+$", base)
+    date = ""
+    if date_match:
+        date = date_match.group(1)
+        base = base[: date_match.start()].rstrip(" -")
+
+    # Agora 'base' termina em "... - CHANNEL_UPPER - Channel Display"
+    parts = base.split(" - ")
+    channel = parts[-1].strip() if parts else ""
+
+    # descarta o penúltimo pedaço (versão uppercase do canal), se existir
+    if len(parts) >= 3:
+        title = " - ".join(parts[:-2]).strip()
+    elif len(parts) > 1:
+        title = " - ".join(parts[:-1]).strip()
+    else:
+        title = base.strip()
+
+    episode_match = EPISODE_PATTERN.search(title)
+    episode = f"EP{episode_match.group(1)}" if episode_match else ""
+
+    # Remove o "#ep57" do título pra não duplicar na tela
+    title = EPISODE_PATTERN.sub("", title).strip(" -")
+
+    return {
+        "title": title,
+        "channel": channel,
+        "episode": episode,
+        "date": date,
+    }
+
+
+# ============================================================
+# BUMPER (IMAGEM ESTÁTICA -> CLIPE CURTO, INTRO = OUTRO)
+# ============================================================
+
+BUMPER_DIR = Path(os.getenv("BUMPER_DIR", "/tmp/bumpers"))
+BUMPER_DURATION = float(os.getenv("BUMPER_DURATION", "5"))
+BUMPER_ENABLED = os.getenv("BUMPER_ENABLED", "true").lower() not in ("false", "0", "")
+
+# Resolução/fps do bumper. Se BUMPER_WIDTH/BUMPER_HEIGHT não forem
+# definidos no .env, detectamos automaticamente a partir do primeiro
+# vídeo real encontrado (evita trocar de resolução no meio da live,
+# o que o YouTube não gosta e pode gerar glitch/erro no encoder).
+BUMPER_WIDTH_ENV = os.getenv("BUMPER_WIDTH")
+BUMPER_HEIGHT_ENV = os.getenv("BUMPER_HEIGHT")
+BUMPER_FPS = os.getenv("BUMPER_FPS", "30")
+
+# Fallback caso a detecção automática falhe e nada esteja no .env
+_FALLBACK_WIDTH, _FALLBACK_HEIGHT = 1920, 1080
+
+BUMPER_WIDTH = int(BUMPER_WIDTH_ENV) if BUMPER_WIDTH_ENV else None
+BUMPER_HEIGHT = int(BUMPER_HEIGHT_ENV) if BUMPER_HEIGHT_ENV else None
+
+
+def detect_video_resolution(video_path):
+    """
+    Usa ffprobe pra ler width/height do primeiro stream de vídeo.
+    Retorna (width, height) ou None se falhar.
+    """
+
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "csv=s=x:p=0",
+                str(video_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+
+        if result.returncode != 0:
+            return None
+
+        output = result.stdout.strip()
+        if "x" not in output:
+            return None
+
+        width_str, height_str = output.split("x")
+        return int(width_str), int(height_str)
+
+    except Exception as e:
+        print(f"[WARN] Não foi possível detectar resolução de {video_path.name}: {e}")
+        return None
+
+
+def ensure_bumper_resolution():
+    """
+    Garante que BUMPER_WIDTH/BUMPER_HEIGHT estejam definidos antes
+    do primeiro bumper ser gerado. Se não vieram do .env, detecta
+    a partir do primeiro vídeo disponível na pasta. Só roda uma vez.
+    """
+
+    global BUMPER_WIDTH, BUMPER_HEIGHT
+
+    if BUMPER_WIDTH and BUMPER_HEIGHT:
+        return  # já veio do .env, respeita a configuração manual
+
+    videos = [
+        p for p in VIDEO_DIR.iterdir()
+        if p.is_file()
+        and p.name.lower().endswith(VIDEO_SUFFIX)
+        and not p.name.startswith("_encode_")
+    ] if VIDEO_DIR.exists() else []
+
+    resolution = None
+    if videos:
+        resolution = detect_video_resolution(videos[0])
+
+    if resolution:
+        BUMPER_WIDTH, BUMPER_HEIGHT = resolution
+        print(f"[BUMPER] Resolução detectada automaticamente: {BUMPER_WIDTH}x{BUMPER_HEIGHT}")
+    else:
+        BUMPER_WIDTH, BUMPER_HEIGHT = _FALLBACK_WIDTH, _FALLBACK_HEIGHT
+        print(
+            f"[WARN] Não foi possível detectar resolução dos vídeos. "
+            f"Usando fallback {BUMPER_WIDTH}x{BUMPER_HEIGHT} "
+            f"— defina BUMPER_WIDTH/BUMPER_HEIGHT no .env se isso não bater "
+            f"com seus vídeos."
+        )
+
+FONT_PATH = os.getenv("OVERLAY_FONT_PATH", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+FONT_PATH_BOLD = os.getenv("OVERLAY_FONT_PATH_BOLD", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
+
+BUMPER_BADGE_TEXT = os.getenv("BUMPER_BADGE_TEXT", "BY PODCUT AGORA")
+
+BUMPER_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def bumper_cache_key(video_path):
+    """
+    Chave de cache baseada no nome do arquivo (não no conteúdo,
+    já que é o metadado no nome que muda o texto). Como o bumper
+    é o mesmo pro intro e pro outro, só existe UM arquivo por vídeo.
+    """
+
+    h = hashlib.sha1(video_path.name.encode("utf-8")).hexdigest()[:16]
+    return BUMPER_DIR / f"bumper_{h}.ts"
+
+
+def render_bumper_image(meta, out_path):
+    """
+    Desenha a imagem estática do bumper com PIL: fundo escuro,
+    faixa/badge no topo, título centralizado e canal/episódio/data
+    embaixo.
+    """
+
+    img = Image.new("RGB", (BUMPER_WIDTH, BUMPER_HEIGHT), color=(15, 15, 18))
+    draw = ImageDraw.Draw(img)
+
+    # Faixa de destaque no topo
+    draw.rectangle([0, 0, BUMPER_WIDTH, 8], fill=(200, 30, 30))
+
+    font_title = ImageFont.truetype(FONT_PATH_BOLD, 58)
+    font_subtitle = ImageFont.truetype(FONT_PATH, 34)
+    font_badge = ImageFont.truetype(FONT_PATH_BOLD, 30)
+
+    title = meta["title"]
+    subtitle_parts = [p for p in [meta["channel"], meta["episode"], meta["date"]] if p]
+    subtitle = "   •   ".join(subtitle_parts)
+
+    # Quebra o título em linhas se for muito largo
+    max_width = BUMPER_WIDTH - 240
+    words = title.split()
+    lines, current = [], ""
+
+    for word in words:
+        test = f"{current} {word}".strip()
+        if draw.textlength(test, font=font_title) <= max_width:
+            current = test
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+
+    lines = lines[:4]  # limita a 4 linhas pra não estourar a tela
+
+    line_height = 74
+    total_height = len(lines) * line_height + 70
+    y = (BUMPER_HEIGHT - total_height) // 2
+
+    for line in lines:
+        w = draw.textlength(line, font=font_title)
+        draw.text(((BUMPER_WIDTH - w) / 2, y), line, font=font_title, fill="white")
+        y += line_height
+
+    y += 25
+    w = draw.textlength(subtitle, font=font_subtitle)
+    draw.text(((BUMPER_WIDTH - w) / 2, y), subtitle, font=font_subtitle, fill=(190, 190, 190))
+
+    # Badge no topo
+    bw = draw.textlength(BUMPER_BADGE_TEXT, font=font_badge)
+    bx, by = (BUMPER_WIDTH - bw) / 2, 70
+    pad = 20
+    draw.rectangle([bx - pad, by - 10, bx + bw + pad, by + 40], fill=(200, 30, 30))
+    draw.text((bx, by - 2), BUMPER_BADGE_TEXT, font=font_badge, fill="white")
+
+    img.save(out_path)
+
+
+def generate_bumper(video_path):
+    """
+    Gera (ou reusa do cache) o clipe de N segundos a partir de
+    uma imagem estática. Encode acontece só na primeira vez que
+    o vídeo aparece — depois disso é sempre reuso do cache.
+    """
+
+    cache_path = bumper_cache_key(video_path)
+
+    if cache_path.exists():
+        return cache_path
+
+    meta = parse_video_metadata(video_path)
+
+    tmp_image = BUMPER_DIR / f"_tmp_{cache_path.stem}.png"
+    render_bumper_image(meta, tmp_image)
+
+    command = [
+        "ffmpeg", "-y",
+        "-loop", "1",
+        "-i", str(tmp_image),
+        "-f", "lavfi",
+        "-i", "anullsrc=r=44100:cl=stereo",
+        "-t", str(BUMPER_DURATION),
+        "-r", BUMPER_FPS,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "20",
+        "-pix_fmt", "yuv420p",
+        "-g", "30",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-f", "mpegts",
+        "-mpegts_flags", "+resend_headers",
+        str(cache_path),
+    ]
+
+    print(f"[BUMPER] Gerando bumper para: {video_path.name}")
+
+    result = subprocess.run(command, capture_output=True, text=True)
+    tmp_image.unlink(missing_ok=True)
+
+    if result.returncode != 0:
+        print(f"[ERROR] Falha ao gerar bumper: {result.stderr.strip()}")
+        return None
+
+    return cache_path
+
+
+def feed_ts_segment(ts_path):
+    """
+    Envia um .ts já pronto (bumper) direto pra FIFO, sem
+    recodificar de novo — é só concatenação via copy.
+    """
+
+    command = [
+        "ffmpeg", "-y",
+        "-re",
+        "-i", str(ts_path),
+        "-c", "copy",
+        "-f", "mpegts",
+        "-mpegts_flags", "+resend_headers",
+        str(FIFO_PATH),
+    ]
+
+    return subprocess.run(command)
+
+
+# ============================================================
 # PUBLISHER — conexão RTMP única e persistente
 # ============================================================
 
@@ -385,6 +690,27 @@ def feed_video(video_path):
     return subprocess.run(command)
 
 
+def feed_video_with_bumpers(video_path):
+    """
+    Envolve feed_video com o bumper (intro + outro, mesma imagem)
+    quando habilitado. O vídeo original nunca é alterado nem
+    recodificado — só o bumper (gerado uma vez e cacheado) passa
+    por encode.
+    """
+
+    bumper = generate_bumper(video_path) if BUMPER_ENABLED else None
+
+    if bumper:
+        feed_ts_segment(bumper)
+
+    result = feed_video(video_path)
+
+    if bumper and result.returncode == 0:
+        feed_ts_segment(bumper)
+
+    return result
+
+
 def feeder_loop():
     """
     Roda em thread separada, pra sempre. Percorre os vídeos em
@@ -410,7 +736,7 @@ def feeder_loop():
             if not running:
                 break
 
-            result = feed_video(video)
+            result = feed_video_with_bumpers(video)
 
             if not running:
                 break
@@ -442,9 +768,13 @@ def main():
     print(f"[CONFIG] Video directory: {VIDEO_DIR}")
     print(f"[CONFIG] Video suffix:    {VIDEO_SUFFIX}")
     print(f"[CONFIG] FIFO:            {FIFO_PATH}")
+    print(f"[CONFIG] Bumper enabled:  {BUMPER_ENABLED}")
     print()
 
     ensure_fifo()
+
+    if BUMPER_ENABLED:
+        ensure_bumper_resolution()
 
     # Feeder roda em background, independente do ciclo de vida
     # do publisher.
