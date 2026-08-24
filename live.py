@@ -7,6 +7,7 @@ import signal
 import hashlib
 import subprocess
 import threading
+import concurrent.futures
 from pathlib import Path
 
 import dotenv
@@ -391,7 +392,11 @@ def parse_video_metadata(video_path):
 # BUMPER (IMAGEM ESTÁTICA -> CLIPE CURTO, INTRO = OUTRO)
 # ============================================================
 
-BUMPER_DIR = Path(os.getenv("BUMPER_DIR", "/tmp/bumpers"))
+# Default: subpasta dentro de VIDEO_DIR (não /tmp), porque /tmp
+# costuma NÃO ser persistido entre restarts do container — o que
+# faria o cache sumir e todo vídeo travar de novo na próxima subida.
+# VIDEO_DIR já é o volume persistente, então o cache sobrevive.
+BUMPER_DIR = Path(os.getenv("BUMPER_DIR", str(VIDEO_DIR / ".bumpers")))
 BUMPER_DURATION = float(os.getenv("BUMPER_DURATION", "5"))
 BUMPER_ENABLED = os.getenv("BUMPER_ENABLED", "true").lower() not in ("false", "0", "")
 
@@ -500,29 +505,42 @@ def bumper_cache_key(video_path):
     return BUMPER_DIR / f"bumper_{h}.ts"
 
 
+# Todas as medidas abaixo (fontes, espaçamentos, padding) foram
+# calibradas pra uma referência de 1920x1080. O fator de escala
+# converte isso proporcionalmente pra qualquer resolução real do
+# bumper, evitando texto gigante em vídeos menores (ex: 640x360).
+_REFERENCE_WIDTH = 1920
+
+
 def render_bumper_image(meta, out_path):
     """
     Desenha a imagem estática do bumper com PIL: fundo escuro,
     faixa/badge no topo, título centralizado e canal/episódio/data
-    embaixo.
+    embaixo. Todos os tamanhos escalam com BUMPER_WIDTH.
     """
+
+    scale = BUMPER_WIDTH / _REFERENCE_WIDTH
+
+    def s(value):
+        """Escala um valor de referência (1920px) e garante mínimo de 1."""
+        return max(1, round(value * scale))
 
     img = Image.new("RGB", (BUMPER_WIDTH, BUMPER_HEIGHT), color=(15, 15, 18))
     draw = ImageDraw.Draw(img)
 
     # Faixa de destaque no topo
-    draw.rectangle([0, 0, BUMPER_WIDTH, 8], fill=(200, 30, 30))
+    draw.rectangle([0, 0, BUMPER_WIDTH, s(8)], fill=(200, 30, 30))
 
-    font_title = ImageFont.truetype(FONT_PATH_BOLD, 58)
-    font_subtitle = ImageFont.truetype(FONT_PATH, 34)
-    font_badge = ImageFont.truetype(FONT_PATH_BOLD, 30)
+    font_title = ImageFont.truetype(FONT_PATH_BOLD, s(58))
+    font_subtitle = ImageFont.truetype(FONT_PATH, s(34))
+    font_badge = ImageFont.truetype(FONT_PATH_BOLD, s(30))
 
     title = meta["title"]
     subtitle_parts = [p for p in [meta["channel"], meta["episode"], meta["date"]] if p]
     subtitle = "   •   ".join(subtitle_parts)
 
     # Quebra o título em linhas se for muito largo
-    max_width = BUMPER_WIDTH - 240
+    max_width = BUMPER_WIDTH - s(240)
     words = title.split()
     lines, current = [], ""
 
@@ -538,8 +556,8 @@ def render_bumper_image(meta, out_path):
 
     lines = lines[:4]  # limita a 4 linhas pra não estourar a tela
 
-    line_height = 74
-    total_height = len(lines) * line_height + 70
+    line_height = s(74)
+    total_height = len(lines) * line_height + s(70)
     y = (BUMPER_HEIGHT - total_height) // 2
 
     for line in lines:
@@ -547,16 +565,16 @@ def render_bumper_image(meta, out_path):
         draw.text(((BUMPER_WIDTH - w) / 2, y), line, font=font_title, fill="white")
         y += line_height
 
-    y += 25
+    y += s(25)
     w = draw.textlength(subtitle, font=font_subtitle)
     draw.text(((BUMPER_WIDTH - w) / 2, y), subtitle, font=font_subtitle, fill=(190, 190, 190))
 
     # Badge no topo
     bw = draw.textlength(BUMPER_BADGE_TEXT, font=font_badge)
-    bx, by = (BUMPER_WIDTH - bw) / 2, 70
-    pad = 20
-    draw.rectangle([bx - pad, by - 10, bx + bw + pad, by + 40], fill=(200, 30, 30))
-    draw.text((bx, by - 2), BUMPER_BADGE_TEXT, font=font_badge, fill="white")
+    bx, by = (BUMPER_WIDTH - bw) / 2, s(70)
+    pad = s(20)
+    draw.rectangle([bx - pad, by - s(10), bx + bw + pad, by + s(40)], fill=(200, 30, 30))
+    draw.text((bx, by - s(2)), BUMPER_BADGE_TEXT, font=font_badge, fill="white")
 
     img.save(out_path)
 
@@ -630,6 +648,74 @@ def feed_ts_segment(ts_path):
 
 
 # ============================================================
+# PREFETCH DE BUMPERS EM BACKGROUND
+# ============================================================
+#
+# Gerar o bumper é um encode bloqueante (alguns segundos). Se
+# isso rodar só na hora de tocar o vídeo, trava a live enquanto
+# gera. Solução: assim que o feeder começa a tocar o vídeo atual
+# (-c copy, streaming em tempo real e demorado por natureza),
+# disparamos em paralelo a geração do bumper do PRÓXIMO vídeo
+# numa thread separada. Quando chegar a vez dele, o bumper já
+# está pronto (ou quase) e o "feed_ts_segment" nem percebe atraso.
+#
+# Só o primeiro vídeo de cada subida da live ainda paga o custo
+# de geração de forma bloqueante, já que não há "vídeo anterior"
+# tocando pra aproveitar o tempo.
+
+_bumper_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+_bumper_futures = {}  # str(video_path) -> Future
+
+
+def prefetch_bumper(video_path):
+    """
+    Dispara a geração do bumper em background, se ainda não
+    existir em cache e não estiver em andamento. Não bloqueia.
+    """
+
+    if not BUMPER_ENABLED or video_path is None:
+        return
+
+    if bumper_cache_key(video_path).exists():
+        return  # já tem, nada a fazer
+
+    key = str(video_path)
+    existing = _bumper_futures.get(key)
+
+    if existing is not None and not existing.done():
+        return  # já está sendo gerado
+
+    _bumper_futures[key] = _bumper_executor.submit(generate_bumper, video_path)
+
+
+def get_bumper(video_path):
+    """
+    Retorna o caminho do bumper pronto pra uso. Se já estiver em
+    cache, retorna na hora. Se estiver sendo gerado em background
+    (prefetch em andamento), espera terminar. Se nunca foi
+    solicitado antes (ex: primeiro vídeo da live), gera agora
+    mesmo, de forma bloqueante — único caso que ainda pode gerar
+    um pequeno soluço na transmissão.
+    """
+
+    if not BUMPER_ENABLED:
+        return None
+
+    cache_path = bumper_cache_key(video_path)
+
+    if cache_path.exists():
+        return cache_path
+
+    key = str(video_path)
+    future = _bumper_futures.get(key)
+
+    if future is not None:
+        return future.result()  # espera o prefetch em andamento terminar
+
+    return generate_bumper(video_path)  # fallback bloqueante (ex: primeiro vídeo)
+
+
+# ============================================================
 # PUBLISHER — conexão RTMP única e persistente
 # ============================================================
 
@@ -690,23 +776,34 @@ def feed_video(video_path):
     return subprocess.run(command)
 
 
-def feed_video_with_bumpers(video_path):
+def feed_video_with_bumpers(video_path, next_video_path=None):
     """
     Envolve feed_video com o bumper (intro + outro, mesma imagem)
     quando habilitado. O vídeo original nunca é alterado nem
     recodificado — só o bumper (gerado uma vez e cacheado) passa
     por encode.
+
+    Se next_video_path for informado, dispara em background a
+    geração do bumper do PRÓXIMO vídeo assim que o atual começa
+    a tocar — assim, quando chegar a vez dele, o bumper já está
+    pronto e não trava a live.
     """
 
-    bumper = generate_bumper(video_path) if BUMPER_ENABLED else None
+    bumper = get_bumper(video_path) if BUMPER_ENABLED else None
 
     if bumper:
         feed_ts_segment(bumper)
 
+    # Aproveita o tempo real que o vídeo atual leva pra tocar
+    # (-re, streaming em tempo real) pra gerar o bumper do
+    # próximo em paralelo, numa thread separada.
+    if BUMPER_ENABLED and next_video_path is not None:
+        prefetch_bumper(next_video_path)
+
     result = feed_video(video_path)
 
     if bumper and result.returncode == 0:
-        feed_ts_segment(bumper)
+        feed_ts_segment(bumper)  # mesmo arquivo já gerado, sem custo extra
 
     return result
 
@@ -731,12 +828,19 @@ def feeder_loop():
 
         print(f"[INFO] {len(videos)} vídeo(s) encontrado(s).")
 
-        for video in videos:
+        for index, video in enumerate(videos):
 
             if not running:
                 break
 
-            result = feed_video_with_bumpers(video)
+            # Próximo da lista atual; se for o último, não há
+            # como saber com certeza qual será o próximo (a ordem
+            # pode ser reembaralhada na próxima volta), então
+            # simplesmente não faz prefetch — o pior caso é esse
+            # único vídeo pagar o custo de geração bloqueante dessa vez.
+            next_video = videos[index + 1] if index + 1 < len(videos) else None
+
+            result = feed_video_with_bumpers(video, next_video)
 
             if not running:
                 break
