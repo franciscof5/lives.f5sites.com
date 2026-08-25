@@ -1,2 +1,4 @@
 python-dotenv
 Pillow
+fastapi
+uvicorn[standard]

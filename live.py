@@ -9,9 +9,13 @@ import subprocess
 import threading
 import concurrent.futures
 from pathlib import Path
+from datetime import datetime, timezone
 
 import dotenv
 from PIL import Image, ImageDraw, ImageFont
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+import uvicorn
 
 dotenv.load_dotenv()
 
@@ -58,6 +62,28 @@ _file_state_cache = {}  # path (str) -> {"size", "gop_checked", "gop_ok"}
 
 running = True
 publisher_process = None
+
+# Estado do "que está tocando agora", exposto pela API/rota web.
+# Atualizado pelo feeder_loop (thread do feeder), lido pela thread
+# do servidor web -- por isso o lock.
+_now_playing_lock = threading.Lock()
+_now_playing = {
+    "kind": None,       # "bumper" ou "video"
+    "video_path": None, # Path do vídeo relacionado (mesmo durante o bumper)
+    "started_at": None, # datetime UTC de quando começou a tocar esse trecho
+}
+
+
+def set_now_playing(kind, video_path):
+    with _now_playing_lock:
+        _now_playing["kind"] = kind
+        _now_playing["video_path"] = video_path
+        _now_playing["started_at"] = datetime.now(timezone.utc)
+
+
+def get_now_playing():
+    with _now_playing_lock:
+        return dict(_now_playing)
 
 
 # ============================================================
@@ -651,17 +677,24 @@ def feed_ts_segment(ts_path):
 # PREFETCH DE BUMPERS EM BACKGROUND
 # ============================================================
 #
-# Gerar o bumper é um encode bloqueante (alguns segundos). Se
-# isso rodar só na hora de tocar o vídeo, trava a live enquanto
-# gera. Solução: assim que o feeder começa a tocar o vídeo atual
-# (-c copy, streaming em tempo real e demorado por natureza),
-# disparamos em paralelo a geração do bumper do PRÓXIMO vídeo
-# numa thread separada. Quando chegar a vez dele, o bumper já
-# está pronto (ou quase) e o "feed_ts_segment" nem percebe atraso.
+# Gerar o bumper é um encode (alguns segundos). Se isso rodar só
+# na hora de tocar o vídeo, trava a live enquanto gera. Solução:
+# assim que o feeder começa a tocar o vídeo atual (-c copy,
+# streaming em tempo real e demorado por natureza), disparamos em
+# paralelo a geração do bumper do PRÓXIMO vídeo numa thread
+# separada. Quando chegar a vez dele, o bumper já está pronto (ou
+# quase) e o "feed_ts_segment" nem percebe atraso.
 #
-# Só o primeiro vídeo de cada subida da live ainda paga o custo
-# de geração de forma bloqueante, já que não há "vídeo anterior"
-# tocando pra aproveitar o tempo.
+# IMPORTANTE: get_bumper() NUNCA bloqueia a live esperando geração
+# terminar. Se não estiver pronto na hora (ex: vídeo tocou mais
+# rápido que a geração, ou muitos vídeos novos em sequência
+# enchendo a fila do worker único), o vídeo simplesmente toca sem
+# bumper dessa vez — sem soluço, sem silêncio na FIFO. Na próxima
+# vez que esse vídeo aparecer na playlist, o bumper já vai estar
+# pronto. Complementa isso a bumper_warmup_loop() abaixo, que gera
+# em background, continuamente, os bumpers que ainda faltam —
+# tanto os do catálogo já existente no boot quanto os de vídeos
+# novos adicionados depois — sem nunca interferir na FIFO.
 
 _bumper_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 _bumper_futures = {}  # str(video_path) -> Future
@@ -688,14 +721,46 @@ def prefetch_bumper(video_path):
     _bumper_futures[key] = _bumper_executor.submit(generate_bumper, video_path)
 
 
+def bumper_warmup_loop():
+    """
+    Roda em thread separada, continuamente, em background. Varre
+    a pasta de vídeos e garante (via prefetch_bumper) que todo
+    vídeo tenha seu bumper gerado — mesmo os que nunca chegaram a
+    tocar ainda. Cobre tanto o "aquecimento" inicial do catálogo
+    inteiro no boot quanto vídeos novos adicionados depois, sem
+    NUNCA bloquear o feeder/publisher: cada geração passa pela
+    mesma fila (executor de 1 worker) usada pelo prefetch normal.
+    """
+
+    while running:
+        try:
+            videos = get_videos()
+
+            for video in videos:
+                if not running:
+                    break
+                prefetch_bumper(video)
+
+                # Pequena pausa entre submissões pra não empilhar
+                # dezenas de vídeos de uma vez só no arranque —
+                # o executor processa um por vez de qualquer forma,
+                # isso só evita gastar tempo escaneando à toa.
+                interruptible_sleep(0.5)
+
+        except Exception as e:
+            print(f"[WARN] Erro no warmup de bumpers: {e}")
+
+        interruptible_sleep(30)  # revisita periodicamente por vídeos novos
+
+
 def get_bumper(video_path):
     """
-    Retorna o caminho do bumper pronto pra uso. Se já estiver em
-    cache, retorna na hora. Se estiver sendo gerado em background
-    (prefetch em andamento), espera terminar. Se nunca foi
-    solicitado antes (ex: primeiro vídeo da live), gera agora
-    mesmo, de forma bloqueante — único caso que ainda pode gerar
-    um pequeno soluço na transmissão.
+    Retorna o caminho do bumper SE já estiver pronto em cache.
+    NUNCA bloqueia a live esperando geração: se ainda não existe
+    (nem foi gerado, nem terminou de gerar em background), apenas
+    dispara/garante o prefetch pra próxima vez e retorna None —
+    o vídeo toca sem bumper só dessa vez. Na próxima passagem
+    desse mesmo vídeo na playlist, o bumper já vai estar pronto.
     """
 
     if not BUMPER_ENABLED:
@@ -706,13 +771,8 @@ def get_bumper(video_path):
     if cache_path.exists():
         return cache_path
 
-    key = str(video_path)
-    future = _bumper_futures.get(key)
-
-    if future is not None:
-        return future.result()  # espera o prefetch em andamento terminar
-
-    return generate_bumper(video_path)  # fallback bloqueante (ex: primeiro vídeo)
+    prefetch_bumper(video_path)  # garante que entra na fila pra próxima vez
+    return None
 
 
 # ============================================================
@@ -792,7 +852,13 @@ def feed_video_with_bumpers(video_path, next_video_path=None):
     bumper = get_bumper(video_path) if BUMPER_ENABLED else None
 
     if bumper:
+        set_now_playing("bumper", video_path)
         feed_ts_segment(bumper)
+    elif BUMPER_ENABLED:
+        print(
+            f"[BUMPER] Ainda não pronto para {video_path.name} — "
+            f"tocando sem bumper desta vez (gerando em background pra próxima)."
+        )
 
     # Aproveita o tempo real que o vídeo atual leva pra tocar
     # (-re, streaming em tempo real) pra gerar o bumper do
@@ -800,9 +866,11 @@ def feed_video_with_bumpers(video_path, next_video_path=None):
     if BUMPER_ENABLED and next_video_path is not None:
         prefetch_bumper(next_video_path)
 
+    set_now_playing("video", video_path)
     result = feed_video(video_path)
 
     if bumper and result.returncode == 0:
+        set_now_playing("bumper", video_path)
         feed_ts_segment(bumper)  # mesmo arquivo já gerado, sem custo extra
 
     return result
@@ -859,6 +927,180 @@ def feeder_loop():
 
 
 # ============================================================
+# WEB — FastAPI com a rota "/" (lista de vídeos + tocando agora)
+# ============================================================
+#
+# Servido em lives.f5sites.com (via proxy reverso apontando pra
+# essa porta). Roda em thread separada, sem interferir no feeder
+# nem no publisher.
+
+API_HOST = os.getenv("API_HOST", "0.0.0.0")
+API_PORT = int(os.getenv("API_PORT", "80"))
+
+app = FastAPI()
+
+
+def _format_elapsed(started_at):
+    if started_at is None:
+        return "—"
+
+    seconds = int((datetime.now(timezone.utc) - started_at).total_seconds())
+    minutes, seconds = divmod(max(seconds, 0), 60)
+    hours, minutes = divmod(minutes, 60)
+
+    if hours:
+        return f"{hours}h {minutes}min {seconds}s"
+    if minutes:
+        return f"{minutes}min {seconds}s"
+    return f"{seconds}s"
+
+
+def _escape_html(text):
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def render_index_html():
+    now_playing = get_now_playing()
+    all_videos = sorted(
+        (
+            p for p in VIDEO_DIR.iterdir()
+            if VIDEO_DIR.exists()
+            and p.is_file()
+            and p.name.lower().endswith(VIDEO_SUFFIX)
+            and not p.name.startswith("_encode_")
+        ) if VIDEO_DIR.exists() else [],
+        key=lambda p: p.name,
+    )
+
+    current_path = now_playing["video_path"]
+    current_kind = now_playing["kind"]
+    elapsed = _format_elapsed(now_playing["started_at"])
+
+    # ---- bloco "tocando agora" ----
+    if current_path is not None:
+        meta = parse_video_metadata(current_path)
+        kind_label = "Bumper (intro/outro)" if current_kind == "bumper" else "Vídeo"
+        now_playing_html = f"""
+        <div class="now-playing">
+          <span class="badge">AO VIVO</span>
+          <h2>{_escape_html(meta['title'])}</h2>
+          <p class="meta">
+            {_escape_html(meta['channel'])}
+            {' • ' + _escape_html(meta['episode']) if meta['episode'] else ''}
+            {' • ' + _escape_html(meta['date']) if meta['date'] else ''}
+          </p>
+          <p class="sub">{kind_label} · há {elapsed}</p>
+        </div>
+        """
+    else:
+        now_playing_html = """
+        <div class="now-playing">
+          <span class="badge badge-off">AGUARDANDO</span>
+          <h2>Nenhum vídeo tocando ainda</h2>
+        </div>
+        """
+
+    # ---- lista completa ----
+    rows = []
+    for video in all_videos:
+        meta = parse_video_metadata(video)
+        is_current = current_path is not None and video == current_path
+        has_bumper = bumper_cache_key(video).exists() if BUMPER_ENABLED else None
+
+        bumper_icon = ""
+        if BUMPER_ENABLED:
+            bumper_icon = "✅" if has_bumper else "⏳"
+
+        row_class = "current" if is_current else ""
+        marker = "▶" if is_current else ""
+
+        rows.append(f"""
+        <tr class="{row_class}">
+          <td>{marker}</td>
+          <td>{_escape_html(meta['title'])}</td>
+          <td>{_escape_html(meta['channel'])}</td>
+          <td>{_escape_html(meta['episode'])}</td>
+          <td>{_escape_html(meta['date'])}</td>
+          <td class="center">{bumper_icon}</td>
+        </tr>
+        """)
+
+    rows_html = "\n".join(rows) if rows else (
+        '<tr><td colspan="6">Nenhum vídeo encontrado em ' + _escape_html(str(VIDEO_DIR)) + '</td></tr>'
+    )
+
+    return f"""<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="refresh" content="10">
+  <title>Elenco B Cast — Live 24/7</title>
+  <style>
+    body {{
+      background: #0f0f12; color: #eee;
+      font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      margin: 0; padding: 40px 24px;
+    }}
+    .container {{ max-width: 960px; margin: 0 auto; }}
+    .now-playing {{
+      background: #1a1a1f; border: 1px solid #2a2a30; border-radius: 12px;
+      padding: 24px 28px; margin-bottom: 32px;
+    }}
+    .badge {{
+      display: inline-block; background: #c81e1e; color: white;
+      font-weight: 700; font-size: 12px; letter-spacing: 0.05em;
+      padding: 4px 10px; border-radius: 4px; margin-bottom: 12px;
+    }}
+    .badge-off {{ background: #444; }}
+    .now-playing h2 {{ margin: 0 0 6px 0; font-size: 26px; }}
+    .now-playing .meta {{ color: #bbb; margin: 0 0 4px 0; }}
+    .now-playing .sub {{ color: #888; font-size: 14px; margin: 0; }}
+    h1 {{ font-size: 18px; color: #999; font-weight: 600;
+          text-transform: uppercase; letter-spacing: 0.05em; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
+    th {{ text-align: left; color: #888; font-weight: 600; padding: 8px 10px;
+          border-bottom: 1px solid #2a2a30; }}
+    td {{ padding: 10px; border-bottom: 1px solid #1e1e24; }}
+    td.center {{ text-align: center; }}
+    tr.current {{ background: #1a2a1a; }}
+    tr.current td {{ color: #baffba; font-weight: 600; }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    {now_playing_html}
+    <h1>Playlist ({len(all_videos)} vídeos)</h1>
+    <table>
+      <thead>
+        <tr>
+          <th></th><th>Título</th><th>Canal</th><th>Episódio</th><th>Data</th><th>Bumper</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows_html}
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>"""
+
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return render_index_html()
+
+
+def start_api_server():
+    print(f"[API] Servindo em http://{API_HOST}:{API_PORT}/")
+    uvicorn.run(app, host=API_HOST, port=API_PORT, log_level="warning")
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -873,6 +1115,7 @@ def main():
     print(f"[CONFIG] Video suffix:    {VIDEO_SUFFIX}")
     print(f"[CONFIG] FIFO:            {FIFO_PATH}")
     print(f"[CONFIG] Bumper enabled:  {BUMPER_ENABLED}")
+    print(f"[CONFIG] API:             http://{API_HOST}:{API_PORT}/")
     print()
 
     ensure_fifo()
@@ -884,6 +1127,16 @@ def main():
     # do publisher.
     feeder_thread = threading.Thread(target=feeder_loop, daemon=True)
     feeder_thread.start()
+
+    # Warmup roda em background, continuamente, gerando bumpers
+    # que ainda faltam -- nunca bloqueia a live.
+    if BUMPER_ENABLED:
+        warmup_thread = threading.Thread(target=bumper_warmup_loop, daemon=True)
+        warmup_thread.start()
+
+    # API web (lista de vídeos + tocando agora), também em background.
+    api_thread = threading.Thread(target=start_api_server, daemon=True)
+    api_thread.start()
 
     while running:
 
