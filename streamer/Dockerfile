@@ -15,6 +15,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY live.py stream.py ./
+COPY live.py ./
 
 CMD ["python", "live.py"]
