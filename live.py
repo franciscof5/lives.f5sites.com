@@ -934,8 +934,8 @@ def feeder_loop():
 # essa porta). Roda em thread separada, sem interferir no feeder
 # nem no publisher.
 
-API_HOST = os.getenv("API_HOST", "lives.f5sites.com")
-API_PORT = int(os.getenv("API_PORT", "80"))
+API_HOST = os.getenv("API_HOST", "0.0.0.0")
+API_PORT = int(os.getenv("API_PORT", "8000"))
 
 app = FastAPI()
 
