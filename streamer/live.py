@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-stream.py — Núcleo da transmissão 24/7 de UMA live: descoberta de
-vídeos, geração/cache de bumpers, feeder (FIFO), publisher (RTMP)
-e reporte periódico de status pro container central (lives.f5sites.com).
+live.py — Container de UMA live: sincroniza vídeos de um bucket
+S3 pra uma pasta local, descobre vídeos, gera/cacheia bumpers,
+alimenta a FIFO (feeder) e publica no YouTube via RTMP (publisher).
+Reporta status periodicamente pro container central
+(lives.f5sites.com).
 
-Não roda sozinho normalmente -- é importado por live.py, que chama
-stream.run().
+Arquivo único de propósito -- ponto de entrada e lógica no mesmo
+lugar. Executado direto: `python live.py`.
 """
 
 import os
@@ -22,6 +24,7 @@ import urllib.error
 from pathlib import Path
 from datetime import datetime, timezone
 
+import boto3
 import dotenv
 from PIL import Image, ImageDraw, ImageFont
 
@@ -55,6 +58,19 @@ FIFO_PATH = Path(os.getenv("FIFO_PATH", "/tmp/youtube_stream.fifo"))
 STREAM_NAME = os.getenv("STREAM_NAME", "live")
 CENTRAL_API_URL = os.getenv("CENTRAL_API_URL", "").rstrip("/")
 REPORT_INTERVAL = float(os.getenv("REPORT_INTERVAL", "5"))
+
+# ---- Origem dos vídeos: bucket S3 (ou compatível) ----
+# VIDEO_DIR deixa de ser um bind-mount do host e vira só uma pasta
+# local (idealmente um volume Docker nomeado, pra servir de cache
+# persistente entre restarts) sincronizada a partir do bucket.
+S3_BUCKET = os.getenv("S3_BUCKET", "")
+S3_PREFIX = os.getenv("S3_PREFIX", "")  # "pasta" dentro do bucket, opcional
+S3_REGION = os.getenv("AWS_DEFAULT_REGION", os.getenv("S3_REGION", "us-east-1"))
+S3_SYNC_INTERVAL = float(os.getenv("S3_SYNC_INTERVAL", "60"))
+# Opcional: endpoint alternativo pra S3-compatíveis (Cloudflare R2,
+# Backblaze B2, DigitalOcean Spaces, MinIO). Deixa em branco pra
+# usar a AWS de verdade.
+S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL") or None
 
 ORDER_VIDEO_FEED = "random" #os.getenv("ORDER_VIDEO_FEED", "Alphabetic").strip().lower()
 
@@ -232,6 +248,130 @@ def interruptible_sleep(seconds):
     end_time = time.time() + seconds
     while running and time.time() < end_time:
         time.sleep(0.1)
+
+
+# ============================================================
+# S3 — sincroniza os vídeos do bucket pra pasta local (VIDEO_DIR)
+# ============================================================
+#
+# VIDEO_DIR passa a ser só um CACHE local (idealmente um volume
+# Docker nomeado, não um bind-mount do host) espelhando o que está
+# no bucket. Todo o resto do pipeline (get_videos, bumper, feeder)
+# continua trabalhando com arquivos locais normalmente -- não
+# precisa saber que a origem é S3.
+#
+# Download é feito pra um arquivo temporário (sufixo ".download",
+# que não bate com VIDEO_SUFFIX) e só depois renomeado pro nome
+# final -- assim o feeder nunca pega um vídeo pela metade.
+
+_s3_client = None
+
+
+def get_s3_client():
+    global _s3_client
+    if _s3_client is None:
+        _s3_client = boto3.client(
+            "s3",
+            region_name=S3_REGION,
+            endpoint_url=S3_ENDPOINT_URL,
+        )
+    return _s3_client
+
+
+def s3_sync_once():
+    """
+    Lista os objetos do bucket/prefixo que terminam com VIDEO_SUFFIX,
+    baixa os que ainda não existem localmente (ou cujo tamanho não
+    bate, indicando download incompleto/corrompido), e remove
+    localmente os que não existem mais no bucket -- a pasta local
+    sempre espelha o bucket.
+    """
+
+    if not S3_BUCKET:
+        return
+
+    client = get_s3_client()
+
+    remote_files = {}  # nome do arquivo -> (key, size)
+
+    try:
+        paginator = client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=S3_PREFIX):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if not key.lower().endswith(VIDEO_SUFFIX.lower()):
+                    continue
+                filename = Path(key).name
+                remote_files[filename] = (key, obj["Size"])
+
+    except Exception as e:
+        print(f"[S3] Erro ao listar s3://{S3_BUCKET}/{S3_PREFIX}: {e}")
+        return
+
+    VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Baixa novos ou incompletos
+    for filename, (key, size) in remote_files.items():
+        local_path = VIDEO_DIR / filename
+
+        if local_path.exists() and local_path.stat().st_size == size:
+            continue  # já sincronizado, pula
+
+        tmp_path = VIDEO_DIR / f"{filename}.download"
+
+        try:
+            print(f"[S3] Baixando: {filename}")
+            client.download_file(S3_BUCKET, key, str(tmp_path))
+            tmp_path.rename(local_path)  # atômico -- só aparece pronto pro feeder
+
+        except Exception as e:
+            print(f"[S3] Falha ao baixar {filename}: {e}")
+            tmp_path.unlink(missing_ok=True)
+
+    # Remove localmente o que não existe mais no bucket (evita
+    # tocar vídeo removido/renomeado lá)
+    if not VIDEO_DIR.exists():
+        return
+
+    for local_file in VIDEO_DIR.iterdir():
+        if not local_file.is_file():
+            continue
+        if not local_file.name.lower().endswith(VIDEO_SUFFIX.lower()):
+            continue  # ignora .download em andamento, _encode_ etc.
+        if local_file.name.startswith("_encode_"):
+            continue  # quarentena local, não mexe
+
+        if local_file.name not in remote_files:
+            print(f"[S3] Removendo localmente (sumiu do bucket): {local_file.name}")
+            try:
+                local_file.unlink()
+            except Exception as e:
+                print(f"[S3] Falha ao remover {local_file.name}: {e}")
+
+
+def s3_sync_loop():
+    """
+    Roda em thread separada, continuamente, re-sincronizando a
+    cada S3_SYNC_INTERVAL segundos. Se S3_BUCKET não estiver
+    configurado, desiste silenciosamente (permite usar VIDEO_DIR
+    como bind-mount local tradicional, sem S3, se preferir).
+    """
+
+    if not S3_BUCKET:
+        print(
+            "[S3] S3_BUCKET não definido -- sincronização desativada, "
+            "usando o conteúdo local de VIDEO_DIR como está."
+        )
+        return
+
+    print(
+        f"[S3] Sincronizando de s3://{S3_BUCKET}/{S3_PREFIX} "
+        f"a cada {S3_SYNC_INTERVAL}s"
+    )
+
+    while running:
+        s3_sync_once()
+        interruptible_sleep(S3_SYNC_INTERVAL)
 
 
 # ============================================================
@@ -1053,9 +1193,19 @@ def run():
     print(f"[CONFIG] Bumper enabled:  {BUMPER_ENABLED}")
     print(f"[CONFIG] Stream name:     {STREAM_NAME}")
     print(f"[CONFIG] Central API:     {CENTRAL_API_URL or '(não configurado)'}")
+    print(f"[CONFIG] S3 bucket:       {('s3://' + S3_BUCKET + '/' + S3_PREFIX) if S3_BUCKET else '(não configurado)'}")
     print()
 
     ensure_fifo()
+
+    # Primeira sincronização é bloqueante de propósito: sem vídeo
+    # nenhum local ainda, não tem o que tocar -- então esperamos o
+    # bucket ser lido pelo menos uma vez antes de seguir. Depois
+    # disso, a sincronização contínua roda em background e nunca
+    # mais bloqueia nada.
+    if S3_BUCKET:
+        print("[S3] Sincronização inicial (pode demorar dependendo do tamanho do bucket)...")
+        s3_sync_once()
 
     if BUMPER_ENABLED:
         ensure_bumper_resolution()
@@ -1070,6 +1220,13 @@ def run():
     if BUMPER_ENABLED:
         warmup_thread = threading.Thread(target=bumper_warmup_loop, daemon=True)
         warmup_thread.start()
+
+    # Sincronização contínua com o S3 roda em background -- pega
+    # vídeos novos e remove os que sumiram do bucket, sem nunca
+    # bloquear o feeder/publisher.
+    if S3_BUCKET:
+        s3_thread = threading.Thread(target=s3_sync_loop, daemon=True)
+        s3_thread.start()
 
     # Report pro central roda em background, continuamente.
     report_thread = threading.Thread(target=reporter_loop, daemon=True)

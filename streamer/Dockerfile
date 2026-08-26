@@ -1,6 +1,6 @@
-# Container STREAMER -- roda o ffmpeg de UMA live e reporta status
-# pro container central (lives.f5sites.com). Um container desses
-# por canal/live.
+# Container STREAMER -- roda o ffmpeg de UMA live, sincronizando
+# os vídeos de um bucket S3. Um container desses por canal/live.
+# Reporta status pro container central (lives.f5sites.com).
 FROM python:3.12-slim
 
 # ffmpeg: remux (-c copy) e geração dos bumpers.
