@@ -643,51 +643,53 @@ def is_file_stable(video_path, min_age=MIN_FILE_AGE_SECONDS):
 
 def get_local_videos():
     """
-    Varredura local tradicional (modo sem S3 -- VIDEO_DIR como
-    bind-mount comum). A ordenação acontece depois, em
-    order_catalog(), não aqui.
+    Varredura local tradicional com debug detalhado.
     """
+
+    print(f"[DEBUG] VIDEO_DIR = {VIDEO_DIR}")
+    print(f"[DEBUG] VIDEO_DIR existe? {VIDEO_DIR.exists()}")
+    print(f"[DEBUG] VIDEO_SUFFIX = {VIDEO_SUFFIX}")
 
     if not VIDEO_DIR.exists():
         print(f"[ERROR] Pasta não existe: {VIDEO_DIR}")
         return []
 
-    candidates = [
-        path
-        for path in VIDEO_DIR.iterdir()
-        if (
-            path.is_file()
-            and path.name.lower().endswith(VIDEO_SUFFIX)
-            and not path.name.startswith("_encode_")
-        )
-    ]
+    try:
+        entries = list(VIDEO_DIR.iterdir())
+    except Exception as e:
+        print(f"[ERROR] Não foi possível listar {VIDEO_DIR}: {e}")
+        return []
 
-    if not CHECKS_FILE_READY:
-        return candidates
+    print(f"[DEBUG] Total de entradas em {VIDEO_DIR}: {len(entries)}")
 
-    valid_videos = []
+    for path in entries:
+        if path.is_file():
+            print(f"[DEBUG] ARQUIVO: {path.name}")
+        else:
+            print(f"[DEBUG] DIRETÓRIO: {path.name}")
 
-    for video in candidates:
+    candidates = []
 
-        if not is_file_stable(video):
-            print(f"[SKIP] Arquivo modificado recentemente: {video.name}")
+    for path in entries:
+        if not path.is_file():
             continue
 
-        key = str(video)
-        cached = _file_state_cache.get(key)
+        name = path.name
 
-        if cached is None:
-            if is_valid_gop(video):
-                _file_state_cache[key] = {"gop_ok": True}
-            else:
-                quarantine_video(video)
-                continue
-            cached = _file_state_cache[key]
+        if name.startswith("_encode_"):
+            print(f"[DEBUG] DESCARTADO _encode_: {name}")
+            continue
 
-        if cached["gop_ok"]:
-            valid_videos.append(video)
+        if not name.lower().endswith(VIDEO_SUFFIX.lower()):
+            print(f"[DEBUG] DESCARTADO SUFIXO: {name}")
+            continue
 
-    return valid_videos
+        print(f"[DEBUG] CANDIDATO ENCONTRADO: {name}")
+        candidates.append(path)
+
+    print(f"[DEBUG] Candidatos finais: {len(candidates)}")
+
+    return candidates
 
 # ============================================================
 # METADADOS DO NOME DO ARQUIVO
