@@ -47,8 +47,7 @@ YOUTUBE_STREAM_KEY = os.getenv("YOUTUBE_STREAM_KEY")
 RESTART_DELAY = int(os.getenv("RESTART_DELAY", "5"))
 
 VIDEO_SUFFIX = os.getenv("VIDEO_SUFFIX", "")
-if not VIDEO_SUFFIX:
-    raise RuntimeError("VIDEO_SUFFIX não configurado no .env")
+
 FIFO_PATH = Path(os.getenv("FIFO_PATH", "/tmp/youtube_stream.fifo"))
 
 # ---- Report pro container central (lives.f5sites.com) ----
@@ -681,7 +680,7 @@ def get_local_videos():
             print(f"[DEBUG] DESCARTADO _encode_: {name}")
             continue
 
-        if not name.lower().endswith(VIDEO_SUFFIX.lower()):
+        if VIDEO_SUFFIX and not name.lower().endswith(VIDEO_SUFFIX.lower()):
             print(f"[DEBUG] DESCARTADO SUFIXO: {name}")
             continue
 
