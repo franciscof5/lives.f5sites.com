@@ -60,17 +60,25 @@ CENTRAL_API_URL = os.getenv("CENTRAL_API_URL", "").rstrip("/")
 REPORT_INTERVAL = float(os.getenv("REPORT_INTERVAL", "5"))
 
 # ---- Origem dos vídeos: bucket S3 (ou compatível) ----
-# VIDEO_DIR deixa de ser um bind-mount do host e vira só uma pasta
-# local (idealmente um volume Docker nomeado, pra servir de cache
-# persistente entre restarts) sincronizada a partir do bucket.
+# Com S3_BUCKET definido, VIDEO_DIR vira só um CACHE ROTATIVO local
+# (não um espelho do bucket inteiro): mantém no máximo CACHE_SIZE
+# vídeos em disco por vez (o atual + os próximos pré-buscados) e
+# apaga cada um assim que termina de tocar. Feito pra disco local
+# limitado -- sem S3_BUCKET, volta ao comportamento antigo (pasta
+# local/bind-mount tradicional, sem cache nem exclusão automática).
 S3_BUCKET = os.getenv("S3_BUCKET", "")
 S3_PREFIX = os.getenv("S3_PREFIX", "")  # "pasta" dentro do bucket, opcional
 S3_REGION = os.getenv("AWS_DEFAULT_REGION", os.getenv("S3_REGION", "us-east-1"))
-S3_SYNC_INTERVAL = float(os.getenv("S3_SYNC_INTERVAL", "60"))
 # Opcional: endpoint alternativo pra S3-compatíveis (Cloudflare R2,
 # Backblaze B2, DigitalOcean Spaces, MinIO). Deixa em branco pra
 # usar a AWS de verdade.
 S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL") or None
+
+# Quantos vídeos manter em cache local ao mesmo tempo (o que está
+# tocando + os pré-buscados). Suba esse número se tiver mais disco
+# e quiser mais margem de segurança contra downloads lentos; desça
+# se o disco for muito apertado (mínimo prático: 2).
+CACHE_SIZE = int(os.getenv("CACHE_SIZE", "5"))
 
 ORDER_VIDEO_FEED = "random" #os.getenv("ORDER_VIDEO_FEED", "Alphabetic").strip().lower()
 
@@ -251,20 +259,26 @@ def interruptible_sleep(seconds):
 
 
 # ============================================================
-# S3 — sincroniza os vídeos do bucket pra pasta local (VIDEO_DIR)
+# S3 — CATÁLOGO REMOTO + CACHE ROTATIVO LOCAL
 # ============================================================
 #
-# VIDEO_DIR passa a ser só um CACHE local (idealmente um volume
-# Docker nomeado, não um bind-mount do host) espelhando o que está
-# no bucket. Todo o resto do pipeline (get_videos, bumper, feeder)
-# continua trabalhando com arquivos locais normalmente -- não
-# precisa saber que a origem é S3.
+# Com S3_BUCKET configurado, a "playlist" vem de uma LISTAGEM do
+# bucket (leve, sem baixar nada) e cada vídeo só é baixado pouco
+# antes de tocar -- mantendo no máximo CACHE_SIZE vídeos em disco
+# ao mesmo tempo. Assim que um vídeo termina de tocar, é apagado
+# do disco local. Sem S3_BUCKET, o comportamento é o antigo: lê
+# VIDEO_DIR como uma pasta local comum (bind-mount), sem cache
+# nem exclusão automática -- nunca mexe nos arquivos do usuário
+# nesse modo.
 #
-# Download é feito pra um arquivo temporário (sufixo ".download",
-# que não bate com VIDEO_SUFFIX) e só depois renomeado pro nome
-# final -- assim o feeder nunca pega um vídeo pela metade.
+# O bumper NÃO depende do vídeo estar baixado: gerar o bumper só
+# usa o NOME do arquivo (pro texto) e a resolução já detectada no
+# boot -- por isso dá pra pré-gerar bumpers do catálogo inteiro
+# sem baixar vídeo nenhum antecipadamente.
 
 _s3_client = None
+_video_cache_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+_video_cache_futures = {}  # filename -> Future
 
 
 def get_s3_client():
@@ -278,21 +292,17 @@ def get_s3_client():
     return _s3_client
 
 
-def s3_sync_once():
+def list_s3_catalog():
     """
-    Lista os objetos do bucket/prefixo que terminam com VIDEO_SUFFIX,
-    baixa os que ainda não existem localmente (ou cujo tamanho não
-    bate, indicando download incompleto/corrompido), e remove
-    localmente os que não existem mais no bucket -- a pasta local
-    sempre espelha o bucket.
+    Lista (sem baixar) os vídeos disponíveis no bucket/prefixo.
+    Retorna uma lista de dicts leves: {filename, key, sort_time}.
     """
 
     if not S3_BUCKET:
-        return
+        return []
 
     client = get_s3_client()
-
-    remote_files = {}  # nome do arquivo -> (key, size)
+    entries = []
 
     try:
         paginator = client.get_paginator("list_objects_v2")
@@ -302,76 +312,168 @@ def s3_sync_once():
                 if not key.lower().endswith(VIDEO_SUFFIX.lower()):
                     continue
                 filename = Path(key).name
-                remote_files[filename] = (key, obj["Size"])
+                if filename.startswith("_encode_"):
+                    continue
+                entries.append({
+                    "filename": filename,
+                    "key": key,
+                    "sort_time": obj["LastModified"],
+                })
 
     except Exception as e:
         print(f"[S3] Erro ao listar s3://{S3_BUCKET}/{S3_PREFIX}: {e}")
-        return
+
+    return entries
+
+
+def order_catalog(entries):
+    """
+    Ordena o catálogo (lista de dicts) de acordo com
+    ORDER_VIDEO_FEED -- mesma lógica de antes, só que operando
+    sobre metadados leves em vez de arquivos locais.
+    """
+
+    if ORDER_VIDEO_FEED == "random":
+        import random
+        shuffled = entries.copy()
+        random.shuffle(shuffled)
+        return shuffled
+
+    if ORDER_VIDEO_FEED == "newest":
+        return sorted(entries, key=lambda e: e["sort_time"], reverse=True)
+
+    if ORDER_VIDEO_FEED == "oldest":
+        return sorted(entries, key=lambda e: e["sort_time"])
+
+    return sorted(entries, key=lambda e: e["filename"])
+
+
+def build_catalog():
+    """
+    Monta a playlist da vez, já ordenada. Em modo S3, vem de uma
+    listagem remota (sem baixar nada); sem S3_BUCKET, cai pro
+    comportamento antigo (varredura de VIDEO_DIR local).
+    """
+
+    if S3_BUCKET:
+        entries = list_s3_catalog()
+    else:
+        entries = [
+            {"filename": p.name, "key": None, "sort_time": p.stat().st_mtime}
+            for p in get_local_videos()
+        ]
+
+    return order_catalog(entries)
+
+
+def download_video(key, filename):
+    """
+    Baixa um vídeo do bucket pra VIDEO_DIR. Download vai pra um
+    arquivo temporário (sufixo ".download", que não bate com
+    VIDEO_SUFFIX) e só depois é renomeado -- assim o feeder nunca
+    pega um arquivo pela metade.
+    """
 
     VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+    local_path = VIDEO_DIR / filename
+    tmp_path = VIDEO_DIR / f"{filename}.download"
 
-    # Baixa novos ou incompletos
-    for filename, (key, size) in remote_files.items():
-        local_path = VIDEO_DIR / filename
+    client = get_s3_client()
+    print(f"[CACHE] Baixando: {filename}")
+    client.download_file(S3_BUCKET, key, str(tmp_path))
+    tmp_path.rename(local_path)
+    return local_path
 
-        if local_path.exists() and local_path.stat().st_size == size:
-            continue  # já sincronizado, pula
 
-        tmp_path = VIDEO_DIR / f"{filename}.download"
+def prefetch_video(entry):
+    """
+    Dispara o download em background, se ainda não existir
+    localmente e não estiver em andamento. Não bloqueia. Sem
+    efeito no modo sem S3 (entry["key"] is None).
+    """
 
-        try:
-            print(f"[S3] Baixando: {filename}")
-            client.download_file(S3_BUCKET, key, str(tmp_path))
-            tmp_path.rename(local_path)  # atômico -- só aparece pronto pro feeder
+    if entry["key"] is None:
+        return  # modo sem S3: já é local, nada a baixar
 
-        except Exception as e:
-            print(f"[S3] Falha ao baixar {filename}: {e}")
-            tmp_path.unlink(missing_ok=True)
+    filename = entry["filename"]
+    local_path = VIDEO_DIR / filename
 
-    # Remove localmente o que não existe mais no bucket (evita
-    # tocar vídeo removido/renomeado lá)
+    if local_path.exists():
+        return
+
+    existing = _video_cache_futures.get(filename)
+    if existing is not None and not existing.done():
+        return  # já sendo baixado
+
+    _video_cache_futures[filename] = _video_cache_executor.submit(
+        download_video, entry["key"], filename
+    )
+
+
+def ensure_video_cached(entry):
+    """
+    Retorna o Path local do vídeo, garantindo que ele exista antes
+    de tocar. Diferente do bumper, aqui NÃO tem como "pular" --
+    sem o arquivo não tem o que transmitir, então esse é o único
+    ponto do pipeline que ainda pode bloquear a live (só acontece
+    se o prefetch não teve tempo de terminar antes da vez desse
+    vídeo -- com CACHE_SIZE bem dimensionado, deve ser raro).
+    """
+
+    filename = entry["filename"]
+    local_path = VIDEO_DIR / filename
+
+    if entry["key"] is None:
+        return local_path  # modo sem S3: sempre já local
+
+    if local_path.exists():
+        return local_path
+
+    future = _video_cache_futures.get(filename)
+    if future is not None:
+        print(f"[CACHE] Aguardando download em andamento: {filename}")
+        return future.result()
+
+    print(f"[CACHE] Cache miss -- baixando agora, bloqueante: {filename}")
+    return download_video(entry["key"], filename)
+
+
+def evict_video(entry):
+    """
+    Remove o vídeo do disco local depois de tocar, liberando
+    espaço. Nunca mexe em nada no modo sem S3 (entry["key"] is
+    None) -- só apaga o que o próprio cache baixou.
+    """
+
+    if entry["key"] is None:
+        return
+
+    local_path = VIDEO_DIR / entry["filename"]
+
+    try:
+        if local_path.exists():
+            local_path.unlink()
+    except Exception as e:
+        print(f"[CACHE] Falha ao remover {entry['filename']}: {e}")
+
+
+def cleanup_stale_downloads():
+    """
+    Roda uma vez no boot: remove qualquer ".download" deixado pra
+    trás por um crash/restart no meio de um download anterior.
+    """
+
     if not VIDEO_DIR.exists():
         return
 
-    for local_file in VIDEO_DIR.iterdir():
-        if not local_file.is_file():
-            continue
-        if not local_file.name.lower().endswith(VIDEO_SUFFIX.lower()):
-            continue  # ignora .download em andamento, _encode_ etc.
-        if local_file.name.startswith("_encode_"):
-            continue  # quarentena local, não mexe
-
-        if local_file.name not in remote_files:
-            print(f"[S3] Removendo localmente (sumiu do bucket): {local_file.name}")
+    for f in VIDEO_DIR.iterdir():
+        if f.is_file() and f.name.endswith(".download"):
+            print(f"[CACHE] Removendo download parcial de execução anterior: {f.name}")
             try:
-                local_file.unlink()
-            except Exception as e:
-                print(f"[S3] Falha ao remover {local_file.name}: {e}")
+                f.unlink()
+            except Exception:
+                pass
 
-
-def s3_sync_loop():
-    """
-    Roda em thread separada, continuamente, re-sincronizando a
-    cada S3_SYNC_INTERVAL segundos. Se S3_BUCKET não estiver
-    configurado, desiste silenciosamente (permite usar VIDEO_DIR
-    como bind-mount local tradicional, sem S3, se preferir).
-    """
-
-    if not S3_BUCKET:
-        print(
-            "[S3] S3_BUCKET não definido -- sincronização desativada, "
-            "usando o conteúdo local de VIDEO_DIR como está."
-        )
-        return
-
-    print(
-        f"[S3] Sincronizando de s3://{S3_BUCKET}/{S3_PREFIX} "
-        f"a cada {S3_SYNC_INTERVAL}s"
-    )
-
-    while running:
-        s3_sync_once()
-        interruptible_sleep(S3_SYNC_INTERVAL)
 
 
 # ============================================================
@@ -534,28 +636,17 @@ def is_file_stable(video_path, min_age=MIN_FILE_AGE_SECONDS):
 # ============================================================
 # ORDENAÇÃO DA PLAYLIST
 # ============================================================
+# (a ordenação de verdade agora é order_catalog(), definida na
+# seção de cache S3 acima -- funciona tanto pro modo S3 quanto
+# pro modo local, já que build_catalog() normaliza os dois em
+# dicts com "sort_time" antes de chamar order_catalog())
 
-def order_videos(videos):
+def get_local_videos():
     """
-    Ordena a lista de vídeos de acordo com ORDER_VIDEO_FEED.
+    Varredura local tradicional (modo sem S3 -- VIDEO_DIR como
+    bind-mount comum). A ordenação acontece depois, em
+    order_catalog(), não aqui.
     """
-
-    if ORDER_VIDEO_FEED == "random":
-        import random
-        shuffled = videos.copy()
-        random.shuffle(shuffled)
-        return shuffled
-
-    if ORDER_VIDEO_FEED == "newest":
-        return sorted(videos, key=lambda p: p.stat().st_mtime, reverse=True)
-
-    if ORDER_VIDEO_FEED == "oldest":
-        return sorted(videos, key=lambda p: p.stat().st_mtime)
-
-    # alphabetic (padrão)
-    return sorted(videos, key=lambda p: p.name)
-
-def get_videos():
 
     if not VIDEO_DIR.exists():
         print(f"[ERROR] Pasta não existe: {VIDEO_DIR}")
@@ -570,8 +661,6 @@ def get_videos():
             and not path.name.startswith("_encode_")
         )
     ]
-
-    candidates = order_videos(candidates)   # <-- troca aqui
 
     if not CHECKS_FILE_READY:
         return candidates
@@ -670,7 +759,7 @@ def parse_video_metadata(video_path):
 # VIDEO_DIR já é o volume persistente, então o cache sobrevive.
 BUMPER_DIR = Path(os.getenv("BUMPER_DIR", str(VIDEO_DIR / ".bumpers")))
 BUMPER_DURATION = float(os.getenv("BUMPER_DURATION", "5"))
-BUMPER_ENABLED = os.getenv("BUMPER_ENABLED", "true").lower() not in ("false", "0", "")
+BUMPER_ENABLED = os.getenv("BUMPER_ENABLED", "false").lower() not in ("false", "0", "")
 
 # Resolução/fps do bumper. Se BUMPER_WIDTH/BUMPER_HEIGHT não forem
 # definidos no .env, detectamos automaticamente a partir do primeiro
@@ -727,7 +816,10 @@ def ensure_bumper_resolution():
     """
     Garante que BUMPER_WIDTH/BUMPER_HEIGHT estejam definidos antes
     do primeiro bumper ser gerado. Se não vieram do .env, detecta
-    a partir do primeiro vídeo disponível na pasta. Só roda uma vez.
+    a partir do primeiro vídeo do catálogo -- em modo S3, isso
+    significa baixar UM vídeo de amostra (bloqueante, só essa vez,
+    inevitável: precisamos do arquivo de verdade pra ler a
+    resolução). Só roda uma vez.
     """
 
     global BUMPER_WIDTH, BUMPER_HEIGHT
@@ -735,16 +827,12 @@ def ensure_bumper_resolution():
     if BUMPER_WIDTH and BUMPER_HEIGHT:
         return  # já veio do .env, respeita a configuração manual
 
-    videos = [
-        p for p in VIDEO_DIR.iterdir()
-        if p.is_file()
-        and p.name.lower().endswith(VIDEO_SUFFIX)
-        and not p.name.startswith("_encode_")
-    ] if VIDEO_DIR.exists() else []
+    catalog = build_catalog()
 
     resolution = None
-    if videos:
-        resolution = detect_video_resolution(videos[0])
+    if catalog:
+        sample_path = ensure_video_cached(catalog[0])
+        resolution = detect_video_resolution(sample_path)
 
     if resolution:
         BUMPER_WIDTH, BUMPER_HEIGHT = resolution
@@ -761,7 +849,7 @@ def ensure_bumper_resolution():
 FONT_PATH = os.getenv("OVERLAY_FONT_PATH", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
 FONT_PATH_BOLD = os.getenv("OVERLAY_FONT_PATH_BOLD", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
 
-BUMPER_BADGE_TEXT = os.getenv("BUMPER_BADGE_TEXT", "BY PODCUT AGORA")
+BUMPER_BADGE_TEXT = os.getenv("BUMPER_BADGE_TEXT", "BYCUTS AGORA")
 
 BUMPER_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -970,22 +1058,26 @@ def prefetch_bumper(video_path):
 def bumper_warmup_loop():
     """
     Roda em thread separada, continuamente, em background. Varre
-    a pasta de vídeos e garante (via prefetch_bumper) que todo
-    vídeo tenha seu bumper gerado — mesmo os que nunca chegaram a
-    tocar ainda. Cobre tanto o "aquecimento" inicial do catálogo
-    inteiro no boot quanto vídeos novos adicionados depois, sem
-    NUNCA bloquear o feeder/publisher: cada geração passa pela
-    mesma fila (executor de 1 worker) usada pelo prefetch normal.
+    o CATÁLOGO (não precisa dos vídeos baixados -- bumper só usa
+    o nome do arquivo) e garante (via prefetch_bumper) que todo
+    vídeo tenha seu bumper gerado, mesmo os que nunca tocaram
+    ainda. Cobre tanto o "aquecimento" inicial do catálogo inteiro
+    no boot quanto vídeos novos adicionados depois, sem NUNCA
+    bloquear o feeder/publisher nem baixar vídeo nenhum à toa.
     """
 
     while running:
         try:
-            videos = get_videos()
+            catalog = build_catalog()
 
-            for video in videos:
+            for entry in catalog:
                 if not running:
                     break
-                prefetch_bumper(video)
+
+                # Path "virtual": não precisa existir de fato --
+                # generate_bumper só lê o .name pra extrair metadados.
+                video_path = VIDEO_DIR / entry["filename"]
+                prefetch_bumper(video_path)
 
                 # Pequena pausa entre submissões pra não empilhar
                 # dezenas de vídeos de uma vez só no arranque —
@@ -1124,49 +1216,66 @@ def feed_video_with_bumpers(video_path, next_video_path=None):
 
 def feeder_loop():
     """
-    Roda em thread separada, pra sempre. Percorre os vídeos em
-    loop, escrevendo cada um na FIFO. Se escrever e não tiver
-    ninguém lendo (publisher caiu), o ffmpeg do feeder trava
-    esperando um leitor aparecer de novo — assim que o publisher
-    reconectar na mesma FIFO, o feeder volta a fluir sozinho.
+    Roda em thread separada, pra sempre. Percorre o catálogo em
+    loop, garantindo cada vídeo em cache local antes de tocar
+    (ensure_video_cached), pré-buscando os próximos CACHE_SIZE-1
+    em background (prefetch_video) e apagando cada um assim que
+    termina de tocar (evict_video) -- mantendo o uso de disco
+    limitado a ~CACHE_SIZE vídeos por vez. No modo sem S3,
+    ensure_video_cached/prefetch_video/evict_video viram no-ops
+    onde cabível e o comportamento é o mesmo de sempre.
     """
 
     while running:
 
-        videos = get_videos()
+        catalog = build_catalog()
 
-        if not videos:
+        if not catalog:
             print("[WAIT] Nenhum vídeo encontrado. Aguardando...")
             interruptible_sleep(10)
             continue
 
-        print(f"[INFO] {len(videos)} vídeo(s) encontrado(s).")
+        print(f"[INFO] {len(catalog)} vídeo(s) encontrado(s) no catálogo.")
 
-        for index, video in enumerate(videos):
+        for index, entry in enumerate(catalog):
 
             if not running:
                 break
 
-            # Próximo da lista atual; se for o último, não há
-            # como saber com certeza qual será o próximo (a ordem
-            # pode ser reembaralhada na próxima volta), então
-            # simplesmente não faz prefetch — o pior caso é esse
-            # único vídeo pagar o custo de geração bloqueante dessa vez.
-            next_video = videos[index + 1] if index + 1 < len(videos) else None
+            video_path = ensure_video_cached(entry)
 
-            result = feed_video_with_bumpers(video, next_video)
+            # Pré-busca a janela de CACHE_SIZE-1 vídeos à frente.
+            # Não olha pro início da lista de novo no fim (mesma
+            # limitação já assumida pro bumper): o último vídeo de
+            # cada volta não tem prefetch, só esse paga o custo de
+            # download bloqueante caso a ordem mude na próxima volta.
+            for lookahead in range(1, CACHE_SIZE):
+                next_index = index + lookahead
+                if next_index < len(catalog):
+                    prefetch_video(catalog[next_index])
+
+            # Path "virtual" só pro bumper saber o nome do próximo
+            # -- não depende do vídeo em si estar baixado.
+            next_entry = catalog[index + 1] if index + 1 < len(catalog) else None
+            next_video_path = (VIDEO_DIR / next_entry["filename"]) if next_entry else None
+
+            result = feed_video_with_bumpers(video_path, next_video_path)
 
             if not running:
                 break
 
             if result.returncode == 0:
-                print(f"[OK] Vídeo terminou: {video.name}")
+                print(f"[OK] Vídeo terminou: {video_path.name}")
             else:
                 print(
                     f"[ERROR] Feeder terminou com código "
-                    f"{result.returncode} em {video.name}"
+                    f"{result.returncode} em {video_path.name}"
                 )
                 interruptible_sleep(RESTART_DELAY)
+
+            # Libera espaço assim que termina de tocar (no-op no
+            # modo sem S3 -- nunca mexe nos arquivos do usuário).
+            evict_video(entry)
 
         if running:
             print("[LOOP] Todos os vídeos foram reproduzidos. Reiniciando...")
@@ -1193,40 +1302,28 @@ def run():
     print(f"[CONFIG] Bumper enabled:  {BUMPER_ENABLED}")
     print(f"[CONFIG] Stream name:     {STREAM_NAME}")
     print(f"[CONFIG] Central API:     {CENTRAL_API_URL or '(não configurado)'}")
-    print(f"[CONFIG] S3 bucket:       {('s3://' + S3_BUCKET + '/' + S3_PREFIX) if S3_BUCKET else '(não configurado)'}")
+    print(f"[CONFIG] S3 bucket:       {('s3://' + S3_BUCKET + '/' + S3_PREFIX) if S3_BUCKET else '(não configurado, modo local)'}")
+    if S3_BUCKET:
+        print(f"[CONFIG] Cache size:      {CACHE_SIZE} vídeo(s) por vez")
     print()
 
     ensure_fifo()
-
-    # Primeira sincronização é bloqueante de propósito: sem vídeo
-    # nenhum local ainda, não tem o que tocar -- então esperamos o
-    # bucket ser lido pelo menos uma vez antes de seguir. Depois
-    # disso, a sincronização contínua roda em background e nunca
-    # mais bloqueia nada.
-    if S3_BUCKET:
-        print("[S3] Sincronização inicial (pode demorar dependendo do tamanho do bucket)...")
-        s3_sync_once()
+    cleanup_stale_downloads()
 
     if BUMPER_ENABLED:
         ensure_bumper_resolution()
 
     # Feeder roda em background, independente do ciclo de vida
-    # do publisher.
+    # do publisher. É o feeder que baixa/pré-busca/apaga vídeos
+    # do cache local (quando S3_BUCKET está configurado).
     feeder_thread = threading.Thread(target=feeder_loop, daemon=True)
     feeder_thread.start()
 
     # Warmup roda em background, continuamente, gerando bumpers
-    # que ainda faltam -- nunca bloqueia a live.
+    # que ainda faltam -- nunca bloqueia a live nem baixa vídeo.
     if BUMPER_ENABLED:
         warmup_thread = threading.Thread(target=bumper_warmup_loop, daemon=True)
         warmup_thread.start()
-
-    # Sincronização contínua com o S3 roda em background -- pega
-    # vídeos novos e remove os que sumiram do bucket, sem nunca
-    # bloquear o feeder/publisher.
-    if S3_BUCKET:
-        s3_thread = threading.Thread(target=s3_sync_loop, daemon=True)
-        s3_thread.start()
 
     # Report pro central roda em background, continuamente.
     report_thread = threading.Thread(target=reporter_loop, daemon=True)
