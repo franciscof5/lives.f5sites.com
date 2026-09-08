@@ -46,7 +46,7 @@ YOUTUBE_STREAM_KEY = os.getenv("YOUTUBE_STREAM_KEY")
 
 RESTART_DELAY = int(os.getenv("RESTART_DELAY", "5"))
 
-VIDEO_SUFFIX = os.getenv("VIDEO_SUFFIX")
+VIDEO_SUFFIX = os.getenv("VIDEO_SUFFIX", "")
 if not VIDEO_SUFFIX:
     raise RuntimeError("VIDEO_SUFFIX não configurado no .env")
 FIFO_PATH = Path(os.getenv("FIFO_PATH", "/tmp/youtube_stream.fifo"))
