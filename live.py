@@ -515,7 +515,7 @@ def ensure_bumper_resolution():
 FONT_PATH = os.getenv("OVERLAY_FONT_PATH", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
 FONT_PATH_BOLD = os.getenv("OVERLAY_FONT_PATH_BOLD", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
 
-BUMPER_BADGE_TEXT = os.getenv("BUMPER_BADGE_TEXT", "BY PODCUT AGORA")
+BUMPER_BADGE_TEXT = os.getenv("BUMPER_BADGE_TEXT", "BYCUTS AGORA")
 
 BUMPER_DIR.mkdir(parents=True, exist_ok=True)
 
